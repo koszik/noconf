@@ -5,14 +5,32 @@
 require 'pp'
 require 'pg'
 require 'json'
+require 'ipaddress'
 
+#=begin
+module IPAddress
+    class IPv4
+	def base
+	    u32toip(@u32 & (((1<<(@prefix.to_i))-1) << (32-@prefix.to_i) ))
+	end
+	def hostmask
+	    u32toip(1<<(32-@prefix.to_i)-1)
+	end
+	def mask
+	    netmask
+	end
+	def u32toip(u32)
+	    [u32].pack("N").unpack("CCCC").join(".")
+	end
+    end
+end
+#=end
 
 class Switch
     attr_reader :features
     def initialize(switch, sql)
 	@switch, @sql = switch, sql
-	@features = Sql.conn.exec_params("SELECT switch_features.* FROM switch_features,switches WHERE switch_features.model=switches.model AND switches.id=$1", [switch])
-	@features = @features.map { |x| if x == "t"; true elsif x == "f"; false else x; end } # todo ugly hack
+	@features = Sql.get("SELECT switch_features.* FROM switch_features,switches WHERE switch_features.model=switches.model AND switches.id=$1", [switch])
     end
 
     def to_s
@@ -20,18 +38,23 @@ class Switch
     end
 
     def add_module(m)
-	prefix, mod, start, last, interface_type = @if.parse(m)
-	(start..last).to_a.each { |i| @if.add_interface prefix+mod+i, interface_type[:bw] }
+#	prefix, mod, start, last, interface_type = @if.parse(m)
+#	(start..last).to_a.each { |i| @if.add_interface prefix+mod+i } ## create is innen menjen, ill ez is create legyen
     end
 
     def interface(interface)
-	@if.new(self, interface)
+	Interface.new(self, interface, @if)
+    end
+
+    def create_interface(interface)
+	_if = Interface.new(self, interface, @if, true)
+	_if.create
     end
 end
 
 class CiscoSwitch < Switch
     def initialize(switch, sql)
-        @if = CiscoInterface
+        @if = CiscoInterface.new(self)
         super(switch, sql)
     end
 end
@@ -47,14 +70,25 @@ end
 
 class Stat
     def self.create(switch, interface)
-	puts "echo n | cp -pi /var/atw/rrd/xdl.rrd /var/atw/rrd/#{switch}/#{interface}"
+	cmd = "echo n | cp -pi /var/atw/rrd/xdl.rrd /var/atw/rrd/#{switch}/#{interface}"
+	puts cmd if Conf.printexec
+	`#{cmd}` unless Conf.noexec
     end
 
     def self.destroy(switch, interface)
-	time = Time.now.to_i
-	puts "mv /var/atw/rrd/#{switch}/#{interface} /var/atw/rrd/archive/#{t}-#{switch}-#{interface}; mv /var/atw/rrd/mvtmp/#{switch}_#{interface} /var/atw/rrd/archive/#{t}-#{switch}-mvtmp-#{interface}"
+	t = Time.now.to_i
+	cmd = "mv /var/atw/rrd/#{switch}/#{interface} /var/atw/rrd/archive/#{t}-#{switch}-#{interface}; mv /var/atw/rrd/mvtmp/#{switch}_#{interface} /var/atw/rrd/archive/#{t}-#{switch}-mvtmp-#{interface}"
+	puts cmd if Conf.printexec
+	`#{cmd}` unless Conf.noexec
     end
 end
+
+class Util
+    def self.unfold(list)
+	list.gsub(/(\d+)-(\d+)/) {($1..$2).to_a.join(",")}
+    end
+end
+
 
 # states:
 # - unused:
@@ -65,23 +99,26 @@ end
 # - l3:
 #	some ints can only be this type (vl, lo)
 
-
 # specific must define: expandInterface(interface), 
 class Interface
     attr_accessor :switch, :interface
-    def initialize(switch, interface)
+
+    def initialize(switch, interface, _if, create = false)
+	@if = _if
 	@switch = switch
-	expand_interface(interface)
-	if @interface_range_last == nil
-	    begin
-	    @if_params = Sql.conn.exec_params("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @interface])[0]
-	    rescue IndexError
-	        @if_params = nil
-	    end
+	@if.expand_interface(interface)
+	@interface = @if.interface
+	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+	if create and @if_params
+	    raise "#{@switch}/#{@interface}: interface already exists"
 	end
+	if !create and !@if_params
+	    raise "#{@switch}/#{@interface}: interface doesn't exist"
+	end
+	@if.if_params = @if_params
     end
     def to_s
-	@switch.to_s+"/"+@interface
+	@switch.to_s+"/"+@if.interface
     end
 
     def ip(ip)
@@ -89,19 +126,16 @@ class Interface
     end
 
     def set(cmd)
-	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($1,$2)", [@switch.to_s, @interface])
+	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
     end
 
-    def unfold(list)
-	list.gsub(/(\d+)-(\d+)/) {($1..$2).to_a.join(",")}
+
+    def unused?
+	raise "#{@switch}/#{@interface}: interface already in use" if @if_params["l2"] or @if_params["l3"]
     end
 
     def used?
-	raise "#{@switch}/#{@interface}: interface not in use" unless @if_params["l2"] == "t" or @if_params["l3"] == "t"
-    end
-
-    def unused?
-	raise "#{@switch}/#{@interface}: interface already in use" unless @if_params["l2"] == "f" and @if_params["l3"] == "f"
+	raise "#{@switch}/#{@interface}: interface not in use" unless @if_params["l2"] or @if_params["l3"]
     end
 
     def is_l2?
@@ -109,7 +143,7 @@ class Interface
     end
 
     def is_l3?
-	raise "#{@switch}/#{@interface}: not in layer3 mode" unless @if_params["l3"] == "t"
+	raise "#{@switch}/#{@interface}: not in layer3 mode" unless @if_params["l3"]
     end
 
     def not_found?
@@ -117,7 +151,7 @@ class Interface
     end
 
     def can_l2?
-	raise "#{@switch}/#{@interface}: interface not capable for layer2 operation" unless @interface_type[:l2] == true
+	raise "#{@switch}/#{@interface}: interface not capable for layer2 operation" unless @if.interface_type[:l2] == true
     end
 
     def physical?
@@ -130,19 +164,15 @@ class Interface
 
     # create interface (insert phys, create logical)
     def create # addmodule, vlan, po
-	@interface_range_last ||= @interface_id
-	(@interface_id..@interface_range_last).to_a.each { |i|
-	    ifname = prefix+mod+i
-	    @if.create(intf) ## not nice
-	    Sql.exec "INSERT INTO if_params (switch, interface, l2, l3, bandwidth) VALUES($1, $2, false, false, $3)", [@switch.to_s, ifname, @interface_type[:bw]]
-	    Stat.create(@switch.to_s, @interface)
-	}
+	# unused is checked during init
+	Sql.exec "INSERT INTO if_params (switch, interface, l2, l3, bandwidth) VALUES($1, $2, false, false, $3)", [@switch.to_s, @if.interface, @if.interface_type[:bw]]
+	Stat.create(@switch.to_s, @if.interface)
     end
 
     def destroy
 	used?
 	if is_l3?
-	    ips = Sql.conn.exec_params("SELECT family(ip),text(ip) ip,nexthop FROM ip WHERE (l3_switch, l3_interface)=($1, $2)", [@switch.to_s, @interface])
+	    ips = Sql.conn.exec_params("SELECT family(ip),text(ip) ip,nexthop FROM ip WHERE (l3_switch, l3_interface)=($1, $2)", [@switch.to_s, @if.interface])
 	    if ips != []
 		ips.each { |ip|
 		    puts "#{ip['family']} #{ip['ip']}"
@@ -154,7 +184,7 @@ class Interface
     end
 
     def clone(from)
-	unused || not_found
+	unused? || not_found?
 	can_l2? if from.is_l2?
 	@if.create
 	if from.vlan
@@ -185,7 +215,7 @@ class Interface
     def layer3 # options, eg rpf?
 	unused?
 	@if.layer3
-	set("l3=true")
+	set("l3=true,rpf=true")
     end
 
     # set port up as an l2 access port
@@ -198,7 +228,7 @@ class Interface
     # set port up as trunk
     def trunk(vlan_list)
 	unused?; can_l2?
-	unfolded = unfold(vlan_list)
+	unfolded = Util.unfold(vlan_list)
 	@if.trunk(vlan_list)
 	set("l2=true,vlan_list={#{unfolded}}")
     end
@@ -211,19 +241,22 @@ class Interface
 
     def add_ip(family, ip, nexthop=nil)
 	is_l3?
-	ip_not_yet_added?
+	ip = Ip.new(ip, @switch.to_s, @interface, nexthop)
+	ip.unused?
 	@if.add_ip(family, ip, nexthop)
-	Sql.exec("INSERT INTO ip (ip, l3_switch, l3_interface, nexthop) VALUES($1, $2, $3, $4)", [ip, @switch.to_s, @interface, nexthop])
+	ip.add
     end
 
     def set_param(param, value)
-	@if.set_param(param, value)
+	if param != "rpf"
+	    @if.set_param(param, value)
+	end
 	set("#{param}='#{value}'") # todo set paramize
     end
-    
+
     def set_params(params)
 	used?
-	params.each {|p,v| set_param(p,v)} 	
+	params.each {|p,v| set_param(p,v)}
     end
 
     def add_extra(extra)
@@ -253,33 +286,38 @@ class Cisco
     end
 
     def interface(cmd)
-	cmd = cmd.join("\n") if cmd.kind_of?(Array)
-	@interface_cmds += cmd
+	cmd = cmd.join("\n ") if cmd.kind_of?(Array)
+	@interface_cmds += " " + cmd + "\n"
     end
 
     def global(cmd)
 	cmd = cmd.join("\n") if cmd.kind_of?(Array)
-	@global_cmds += cmd
+	@global_cmds += cmd + "\n"
     end
 
     def acl(cmd)
-	cmd = cmd.join("\n") if cmd.kind_of?(Array)
-	@acl_cmds += cmd
+	cmd = cmd.join(" \n") if cmd.kind_of?(Array)
+	@acl_cmds += " "+ cmd + "\n"
     end
 
     def commit
-	Cisco.cmd @global_cmds
-	Cisco.cmd "interface #{@interface}\n#{@interface_cmds}"
+	Cisco.cmd @global_cmds+"interface #{@interface}\n#{@interface_cmds}"
     end
 
 
     def self.cmd(command)
-	puts "cisco=>"+command
+	puts "!cstart\n"+command+"\!cend"
     end
 end
 
 
-class CiscoInterface < Interface
+class CiscoInterface
+    attr_accessor :interface_range_last, :interface, :interface_type, :interface_id, :prefix, :if_params
+
+    def initialize(switch)
+	@switch = switch
+    end
+
     # interface_types used in generic switch; must provide at least :bw
     def self.interface_types() {
 	"Ethernet"		=> {:bw =>    10, :locigal => false, :l2 =>  true},
@@ -296,7 +334,7 @@ class CiscoInterface < Interface
     def self.parse(intf)
 	_, prefix, mod, start, _, last = /^([a-zA-Z-]+)(\d+\/)?(\d+)(-(\d+))?/.match(intf).to_a
 	prefix = IntLib.prefix_match(prefix, CiscoInterface.interface_types.keys)
-	interface_type = CiscoInterface.interface_types[@prefix]
+	interface_type = CiscoInterface.interface_types[prefix]
 	[prefix, mod, start, last, interface_type]
     end
 
@@ -305,15 +343,13 @@ class CiscoInterface < Interface
 	@interface = @prefix + (@module||"") + @interface_id
     end
 
-    def create(description)
-	cisco = Cisco.new("interface", @interface)
-	# todo: vlans should be managed elsewhere
-	if @prefix == "Vlan"
-	    cisco.global ["vlan #{@interface_id}", "name name-#{@interface_id}", "exit !nowarning"]
+    def layer2_init(cisco)
+	if !@interface_type[:logical]
+	    # trunk will turn it back on
+	    cisco.interface "no cdp enable" # TODO: in case of 'po' it could be used yet it's logical # TODO: should not be turned off on infra links
 	end
-	cisco.interface ["load-interval 30", "no shutdown", "description #{description}"]
+	cisco.interface ["load-interval 30", "no shutdown"]
 	cisco.global "default interface #{@interface}"
-	cisco.commit
     end
 
     def destroy
@@ -328,6 +364,10 @@ class CiscoInterface < Interface
 
     def layer3
 	cisco = Cisco.new("interface", @interface)
+	# todo: vlans should be managed elsewhere
+	if @prefix == "Vlan"
+	    cisco.global ["vlan #{@interface_id}", "name name-#{@interface_id}", "exit !nowarning"]
+	end
 	if @interface_type[:l2] == true
 	    cisco.interface ["no cdp enable", "no switchport"]
 	end
@@ -338,13 +378,14 @@ class CiscoInterface < Interface
 	    cisco.interface ["ip address #{ip} 255.255.255.0"]
 	end
 	cisco.interface ["ip flow ingress"] if @switch.features["netflow"]
-	cisco.interface ["no ip redirects"]
-	cisco.interface ["no cdp enable"] if physical?
+	cisco.interface ["no ip redirects", "no shutdown", "load-interval 30"]
+	cisco.interface ["no cdp enable"] unless @interface_type[:logical]
 	cisco.commit
     end
 
     def access(vlan)
 	cisco = Cisco.new("interface", @interface)
+	layer2_init(cisco)
 	cisco.interface [
 	    "switchport",
 	    "switchport mode access",
@@ -363,6 +404,7 @@ class CiscoInterface < Interface
 
     def trunk(vlan_list)
 	cisco = Cisco.new("interface", @interface)
+	layer2_init(cisco)
 	cisco.interface [
 	    "switchport",
 	    "switchport trunk encapsulation dot1q",
@@ -380,25 +422,60 @@ class CiscoInterface < Interface
     end
 
     def add_ip(family, ip, nexthop=nil)
-	mod_ip("", ip, nexthop)
+	case family
+	when :ipv4
+	    mod_ip("", ip, nexthop)
+	when :ipv6
+	    mod_ip6("", ip, nexthop)
+	else
+	    raise "unknown ip version"
+	end
     end
 
     def del_ip(family, ip, nexthop=nil)
-	mod_ip("no", ip, nexthop)
+	case family
+	when :ipv4
+	    mod_ip("no", ip, nexthop)
+	when :ipv6
+	    mod_ip6("no", ip, nexthop)
+	else
+	    raise "unknown ip version"
+	end
     end
 
     def mod_ip(del, ip, nexthop)
 	nexthop ||= ""
+	ip = IPAddress.parse(ip.ip)
 	ip_mask, ip_invmask, ip_base = ip.mask(), ip.hostmask(), ip.base() 
 	cisco = Cisco.new("interface", @interface)
 	cisco.acl "#{del} permit ip #{ip_base} #{ip_invmask} any"
 	if(nexthop =~ /^(.*)\/(.*?)( secondary)?$/)
 	    ip2, mask2, sec = $1, $2, $3
-	    nextip = nil #new Net::Netmask("$ip2/$mask2");
+	    nextip = IPAddress.parse("#{ip2}/#{mask2}");
 	    raise "nexthop error" if ip_base != nextip.base or ip_mask != nextip.mask
 	    cisco.interface "#{del} ip address #{ip2} #{nextip.mask} #{sec} !nowarning" # using a /31 generates a warning
 	else
 	    cisco.global "#{del} ip route #{ip_base} #{ip_mask} #{@interface} #{nexthop}"
+	end
+	if @if_params["rpf"]
+	    raise "no rpf support yet"
+	end
+	cisco.commit
+    end
+
+    def mod_ip6(del, ip, nexthop)
+	nexthop ||= ""
+	ip = IPAddress.parse(ip.ip)
+	cisco = Cisco.new("interface", @interface)
+	cisco.acl ["#{del} permit ipv6 FE80::/10 #{ip}", "#{del} permit ipv6 #{ip} any"]
+	if(nexthop =~ /\//) # ifes ip
+	    cisco.interface "#{del} ipv6 address #{nexthop}"
+	else
+	    cisco.global "#{del} ipv6 route #{ip} #{nexthop}"
+	end
+
+	if @if_params["rpf"]
+	    raise "no rpf support yet"
 	end
 	cisco.commit
     end
@@ -416,20 +493,39 @@ class CiscoInterface < Interface
 	else
 	    raise "unknown parameter"
 	end
+	cisco.commit
+    end
+
+    def add_extra(extra)
+	cisco = Cisco.new("interface", @interface)
+	cisco.interface extra
+	cisco.commit
     end
 end
 
+
 class Ip
     attr_accessor :interface, :ip
-    def initialize(interface, ip, nexthop = nil)
-	@interface, @ip, @nexthop = interface, ip, nexthop
+    def initialize(ip, switch, interface, nexthop = nil)
+	nexthop ||= "0.0.0.0/0" # TODO ipv6
+	@interface, @ip, @nexthop, @switch = interface, ip, nexthop, switch
+	@sql = Sql.get("SELECT * FROM ip WHERE (ip, l3_switch, l3_interface, nexthop)=($1::inet, $2, $3, $4::inet)", [ip, switch, interface, nexthop])
     end
-    def to_s
-	@interface.to_s+":"+@ip
+
+    def unused?
+	raise "#{@switch}/#{@interface}:#{@ip}/#{@nexthop}: exact route already exists!" if @sql
+    end
+
+    def used?
+	raise "#{@switch}/#{@interface}:#{@ip}/#{@nexthop}: exact route doesn't exist!" unless @sql
     end
 
     def add
-	self
+	Sql.exec("INSERT INTO ip (ip, l3_switch, l3_interface, nexthop) VALUES($1, $2, $3, $4)", [@ip, @switch, @interface, @nexthop])
+    end
+
+    def remove
+	Sql.exec("DELETE FROM ip WHERE (ip, l3_switch, l3_interface, nexthop)=($1, $2, $3, $4)", [@ip, @switch, @interface, @nexthop])
     end
 end
 
@@ -437,6 +533,19 @@ class Conf
     def self.get
 	return @@config if defined? @@config
 	@@config = JSON.parse(File.read('cfg.json'))
+    end
+    def self.nosql
+return false
+	true
+    end
+    def self.printsql
+	true
+    end
+    def self.noexec
+	true
+    end
+    def self.printexec
+	true
     end
 end
 
@@ -447,7 +556,22 @@ class Sql
 	@@conn = PG.connect(Conf.get["db"])
     end
     def self.exec(query, params=nil)
-	print query+"; "; pp params
+	if Conf.printsql
+	    print query+"; "; pp params
+	end
+	if !Conf.nosql
+	    @@conn.exec(query, params)
+	end
+    end
+    def self.get(query, params)
+	r = @@conn.exec_params(query, params)
+	begin
+	    r = r[0]
+	rescue IndexError
+	    return nil
+	end
+	r.each { |key,x| if x == "t"; r[key]=true elsif x == "f"; r[key]=false; end } # todo ugly
+	r
     end
 end
 
@@ -457,11 +581,6 @@ end
 # Switch("c03").addmodule("te1/1-4")
 # Switch("c03").interface("vlan2103").add_ip("10.0.0.0/30", "10.0.0.1/30")
 
-
-sw = Switch("c03")
-int = sw.interface("te4/4")
-int.create("des")
-puts int
 exit
 #ip = int.ip("1.2.3.4")
 ip = Switch("c01").interface("fast1").ip("1.2.3.4").add
