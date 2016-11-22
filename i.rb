@@ -6,8 +6,8 @@ require 'pp'
 require 'pg'
 require 'json'
 require 'ipaddress'
+require 'fileutils'
 
-#=begin
 module IPAddress
     class IPv4
 	def base
@@ -24,7 +24,7 @@ module IPAddress
 	end
     end
 end
-#=end
+
 
 class Switch
     attr_reader :features
@@ -50,7 +50,18 @@ class Switch
 	_if = Interface.new(self, interface, @if, true)
 	_if.create
     end
+
+    def self.create(smallname, hostname, ip, model)
+	#Sql.exec("INSERT INTO switches (id, description, ip, model) VALUES($1, $2, $3, $4)", [smallname, hostname, ip, model]);
+	#return if($sw->{virtual});
+	return if Conf.noexec
+	FileUtils.mkdir "/home/rrd/data/#{hostname}"
+	FileUtils.chown "rrd", nil, "/home/rrd/data/#{hostname}"
+	FileUtils.symlink "/home/rrd/data/#{hostname}", "/home/rrd/data/#{smallname}"
+	File.open("/home/rrd/scripts/get/update-autoadded", "a") { |f| f.puts "./switch #{hostname} #{ip} &" }
+    end
 end
+
 
 class CiscoSwitch < Switch
     def initialize(switch, sql)
@@ -58,7 +69,6 @@ class CiscoSwitch < Switch
         super(switch, sql)
     end
 end
-
 
 
 def Switch(switch)
@@ -83,6 +93,7 @@ class Stat
     end
 end
 
+
 class Util
     def self.unfold(list)
 	list.gsub(/(\d+)-(\d+)/) {($1..$2).to_a.join(",")}
@@ -98,7 +109,6 @@ end
 #	phy or po usually
 # - l3:
 #	some ints can only be this type (vl, lo)
-
 # specific must define: expandInterface(interface), 
 class Interface
     attr_accessor :switch, :interface
@@ -127,6 +137,12 @@ class Interface
 
     def set(cmd)
 	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+    end
+
+    def set1(cmd, param)
+	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($2,$3)", [param, @switch.to_s, @if.interface])
+	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
     end
 
 
@@ -139,7 +155,7 @@ class Interface
     end
 
     def is_l2?
-	@if_params["l2"] == "t"
+	@if_params["l2"]
     end
 
     def is_l3?
@@ -151,11 +167,11 @@ class Interface
     end
 
     def can_l2?
-	raise "#{@switch}/#{@interface}: interface not capable for layer2 operation" unless @if.interface_type[:l2] == true
+	raise "#{@switch}/#{@interface}: interface not capable for layer2 operation" unless @if.interface_type[:l2]
     end
 
     def physical?
-	raise "#{@switch}/#{@interface}: interface is not physical" unless @interface_type[:physical] == true
+	raise "#{@switch}/#{@interface}: interface is not physical" unless @interface_type[:physical]
     end
 
     def remove
@@ -173,12 +189,10 @@ class Interface
 	used?
 	if is_l3?
 	    ips = Sql.conn.exec_params("SELECT family(ip),text(ip) ip,nexthop FROM ip WHERE (l3_switch, l3_interface)=($1, $2)", [@switch.to_s, @if.interface])
-	    if ips != []
-		ips.each { |ip|
-		    puts "#{ip['family']} #{ip['ip']}"
-		    del_ip(ip['family'], ip['ip'])
-		}
-	    end
+	    ips.each { |ip|
+		puts "#{ip['family']} #{ip['ip']}"
+		del_ip(ip['family'], ip['ip'])
+	    }
 	    # remove acl
 	end
     end
@@ -239,18 +253,68 @@ class Interface
 	@if.channel_member(channel)
     end
 
+    def flat(v)
+	last, start, ret = nil, nil, nil
+	v.split(",").each{ |l| l=l.to_i
+	    if last != nil
+		if last != l - 1
+		    if start == last
+			ret += ","
+		    else
+			ret += "-#{last},"
+		    end
+		    ret += "#{l}"
+		    start = l
+		end
+	    else
+		ret = "#{l}"
+		start = l
+	    end
+	    last = l
+	}
+	ret += "-#{last}" if start != last
+	ret
+    end
+
+    def get_config
+	used?
+	if @if_params["l3"]
+	    @if.layer3
+	    Ip.list(@switch, @interface).each { |ip|
+		family = ip["family"] == "4"? :ipv4 : :ipv6
+		@if.add_ip(family, ip["ip"], ip["nexthop"])
+	    }
+	elsif @if_params["l2"]
+	    if @if_params["vlan_list"]
+		@if.trunk(flat(@if_params["vlan_list"][1..-2]))
+	    elsif @if_params["vlan"]
+		@if.access(@if_params["vlan"])
+	    end
+	end
+	@if.add_extra(@if_params["if_extra"]) if @if_params["if_extra"]
+	["description", "mtu"].each { |v|
+	    @if.set_param(v, @if_params[v]) if @if_params[v]
+	}
+    end
+
     def add_ip(family, ip, nexthop=nil)
 	is_l3?
 	ip = Ip.new(ip, @switch.to_s, @interface, nexthop)
 	ip.unused?
-	@if.add_ip(family, ip, nexthop)
+	@if.add_ip(family, ip.ip, nexthop)
 	ip.add
     end
 
+    def del_ip(family, ip, nexthop=nil)
+	is_l3?
+	ip = Ip.new(ip, @switch.to_s, @interface, nexthop)
+	ip.used?
+	@if.del_ip(family, ip.ip, nexthop)
+	ip.remove
+    end
+
     def set_param(param, value)
-	if param != "rpf"
-	    @if.set_param(param, value)
-	end
+	@if.set_param(param, value)
 	set("#{param}='#{value}'") # todo set paramize
     end
 
@@ -261,6 +325,7 @@ class Interface
 
     def add_extra(extra)
 	@if.add_extra(extra)
+	set1("if_extra=COALESCE(if_extra||'\n','')||$1", extra)
     end
 
     def del_extra(extra)
@@ -273,11 +338,12 @@ class IntLib
     # return matching element(s) from list
     def self.prefix_match(prefix, list)
 	ret = list.select{|x| x.upcase.start_with? prefix.upcase}
-	raise "unknown interface name (#{interface})" if ret.length == 0
-	raise "ambigous interface name (#{interface})" if ret.length > 1
+	raise "unknown interface prefix (#{prefix})" if ret.length == 0
+	raise "ambigous interface prefix (#{prefix})" if ret.length > 1
 	ret[0]
     end
 end
+
 
 class Cisco
     def initialize(type, interface)
@@ -344,9 +410,8 @@ class CiscoInterface
     end
 
     def layer2_init(cisco)
-	if !@interface_type[:logical]
-	    # trunk will turn it back on
-	    cisco.interface "no cdp enable" # TODO: in case of 'po' it could be used yet it's logical # TODO: should not be turned off on infra links
+	if !@interface_type[:logical] # TODO: in case of 'po' it could be used yet it's logical
+	    cisco.interface "no cdp enable"
 	end
 	cisco.interface ["load-interval 30", "no shutdown"]
 	cisco.global "default interface #{@interface}"
@@ -368,12 +433,13 @@ class CiscoInterface
 	if @prefix == "Vlan"
 	    cisco.global ["vlan #{@interface_id}", "name name-#{@interface_id}", "exit !nowarning"]
 	end
-	if @interface_type[:l2] == true
+	if @interface_type[:l2]
 	    cisco.interface ["no cdp enable", "no switchport"]
 	end
 	if @switch.features["unnumbered"]
 	    cisco.interface ["ip unnumbered Loopback101"] # todo config?
 	else
+	    # TODO getunnumberedip
 	    ip = getunnumberedip
 	    cisco.interface ["ip address #{ip} 255.255.255.0"]
 	end
@@ -418,7 +484,7 @@ class CiscoInterface
     def channel_member(channel)
 	cisco = Cisco.new("interface", @interface)
 	cisco.interface ["channel-group #{channel} mode active"] # TODO mode
-	cisco.commit	
+	cisco.commit
     end
 
     def add_ip(family, ip, nexthop=nil)
@@ -445,7 +511,7 @@ class CiscoInterface
 
     def mod_ip(del, ip, nexthop)
 	nexthop ||= ""
-	ip = IPAddress.parse(ip.ip)
+	ip = IPAddress.parse(ip)
 	ip_mask, ip_invmask, ip_base = ip.mask(), ip.hostmask(), ip.base() 
 	cisco = Cisco.new("interface", @interface)
 	cisco.acl "#{del} permit ip #{ip_base} #{ip_invmask} any"
@@ -465,7 +531,7 @@ class CiscoInterface
 
     def mod_ip6(del, ip, nexthop)
 	nexthop ||= ""
-	ip = IPAddress.parse(ip.ip)
+	ip = IPAddress.parse(ip)
 	cisco = Cisco.new("interface", @interface)
 	cisco.acl ["#{del} permit ipv6 FE80::/10 #{ip}", "#{del} permit ipv6 #{ip} any"]
 	if(nexthop =~ /\//) # ifes ip
@@ -490,6 +556,7 @@ class CiscoInterface
 	when "acl_in"
 	when "acl_out"
 	when "bw"
+	# when "rpf" ## TODO
 	else
 	    raise "unknown parameter"
 	end
@@ -520,6 +587,10 @@ class Ip
 	raise "#{@switch}/#{@interface}:#{@ip}/#{@nexthop}: exact route doesn't exist!" unless @sql
     end
 
+    def self.list(switch, interface)
+	Sql.conn.exec_params("SELECT family(ip),text(ip) ip,nexthop FROM ip WHERE (l3_switch, l3_interface)=($1, $2)", [switch, interface])
+    end
+
     def add
 	Sql.exec("INSERT INTO ip (ip, l3_switch, l3_interface, nexthop) VALUES($1, $2, $3, $4)", [@ip, @switch, @interface, @nexthop])
     end
@@ -529,19 +600,21 @@ class Ip
     end
 end
 
+
 class Conf
     def self.get
 	return @@config if defined? @@config
 	@@config = JSON.parse(File.read('cfg.json'))
     end
     def self.nosql
-return false
+#return false
 	true
     end
     def self.printsql
 	true
     end
     def self.noexec
+#return false
 	true
     end
     def self.printexec
@@ -576,12 +649,11 @@ class Sql
 end
 
 
-
 # Switch("c03").interface("vlan2103").create
 # Switch("c03").addmodule("te1/1-4")
 # Switch("c03").interface("vlan2103").add_ip("10.0.0.0/30", "10.0.0.1/30")
 
-exit
+=begin
 #ip = int.ip("1.2.3.4")
 ip = Switch("c01").interface("fast1").ip("1.2.3.4").add
 puts ip
@@ -597,3 +669,4 @@ Sql.conn.exec( "SELECT * FROM pg_stat_activity" ) do |result|
 end
 
 Sql.conn.exec("SELECT * FROM if_params WHERE vlan_list is not null") { |r| r.each { |x| puts x } }
+=end
