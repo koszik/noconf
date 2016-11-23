@@ -13,7 +13,7 @@ module IPAddress
 	def base
 	    u32toip(@u32 & (((1<<(@prefix.to_i))-1) << (32-@prefix.to_i) ))
 	end
-	def hostmask
+	def invmask
 	    u32toip(1<<(32-@prefix.to_i)-1)
 	end
 	def mask
@@ -165,11 +165,13 @@ class Interface
     def set(cmd)
 	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
 	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+	@if.if_params = @if_params
     end
 
     def set1(cmd, param)
 	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($2,$3)", [param, @switch.to_s, @if.interface])
 	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+	@if.if_params = @if_params
     end
 
 
@@ -299,36 +301,50 @@ class Interface
 
     def add_ip(ip, nexthop=nil)
 	is_l3?
-	ip = Ip.new(ip, @switch.to_s, @interface, nexthop)
+	secondary = Ip.primaryv4?(@switch, @interface)
+	ipa = IPAddress.parse(ip)
+	nexthopa = nil
+	if nexthop
+	    nexthopa = IPAddress.parse(nexthop)
+	    raise "nexthop error" if ipa.base != nexthopa.base or ipa.mask != nexthopa.mask
+	end
+	ip = Ip.new(ip, @switch.to_s, @interface, nexthop, secondary)
 	ip.unused?
-	@if.add_ip(ip.ip, nexthop)
+	@if.add_ip(ipa, nexthopa, secondary)
 	ip.add
     end
 
     def del_ip(ip, nexthop=nil)
 	is_l3?
+	ipa = IPAddress.parse(ip)
 	ip = Ip.new(ip, @switch.to_s, @interface, nexthop)
 	ip.used?
-	@if.del_ip(ip.ip, nexthop)
+	if nexthop
+	    nexthopa = IPAddress.parse(nexthop)
+	    raise "nexthop error" if ipa.base != nexthopa.base or ipa.mask != nexthopa.mask
+	end
+	@if.del_ip(ipa, nexthopa, ip.secondary?)
 	ip.remove
     end
 
     def set_param(param, value)
+	used?
 	@if.set_param(param, value)
 	set("#{param}='#{value}'") # todo set paramize
     end
 
     def set_params(params)
-	used?
 	params.each {|p,v| set_param(p,v)}
     end
 
     def add_extra(extra)
+	used?
 	@if.add_extra(extra)
 	set1("if_extra=COALESCE(if_extra||'\n','')||$1", extra)
     end
 
     def del_extra(extra)
+	used?
 	@if.del_extra(extra)
     end
 
@@ -489,51 +505,44 @@ class CiscoInterface
 	@cisco.interface ["channel-group #{channel} mode active"] # TODO mode
     end
 
-    def add_ip(ip, nexthop=nil)
-	mod_ip("", ip, nexthop)
+    def add_ip(ip, nexthop, secondary=nil)
+	mod_ip("", ip, nexthop, secondary)
     end
 
-    def del_ip(ip, nexthop=nil)
-	mod_ip("no", ip, nexthop)
+    def del_ip(ip, nexthop, secondary=nil)
+	mod_ip("no", ip, nexthop, secondary)
     end
 
-    def mod_ip(del, ip, nexthop)
+    def mod_ip(del, ip, nexthop, secondary)
 	if ip =~ /:/
 	    mod_ip6(del, ip, nexthop)
 	else
-	    mod_ip4(del, ip, nexthop)
+	    mod_ip4(del, ip, nexthop, secondary)
 	end
     end
 
-    def mod_ip4(del, ip, nexthop)
-	nexthop ||= ""
-	ip = IPAddress.parse(ip)
-	ip_mask, ip_invmask, ip_base = ip.mask(), ip.hostmask(), ip.base() 
-	@cisco.acl "#{del} permit ip #{ip_base} #{ip_invmask} any"
-	if(nexthop =~ /^(.*)\/(.*?)( secondary)?$/)
-	    ip2, mask2, sec = $1, $2, $3
-	    nextip = IPAddress.parse("#{ip2}/#{mask2}");
-	    raise "nexthop error" if ip_base != nextip.base or ip_mask != nextip.mask
-	    @cisco.interface "#{del} ip address #{ip2} #{nextip.mask} #{sec} !nowarning" # using a /31 generates a warning
+    def mod_ip4(del, ip, nexthop, secondary)
+	if(nexthop)
+	    sec = secondary ? "secondary" : ""
+	    @cisco.interface "#{del} ip address #{nexthop} #{nexthop.mask} #{sec} !nowarning" # using a /31 generates a warning
 	else
-	    @cisco.global "#{del} ip route #{ip_base} #{ip_mask} #{@interface} #{nexthop}"
+	    @cisco.global "#{del} ip route #{ip.base} #{ip.mask} #{@interface} #{nexthop}"
 	end
 	if @if_params["rpf"]
+	    @cisco.acl "#{del} permit ip #{ip.base} #{ip.invmask} any"
 	    raise "no rpf support yet"
 	end
     end
 
     def mod_ip6(del, ip, nexthop)
-	nexthop ||= ""
-	ip = IPAddress.parse(ip)
-	@cisco.acl ["#{del} permit ipv6 FE80::/10 #{ip}", "#{del} permit ipv6 #{ip} any"]
-	if(nexthop =~ /\//) # ifes ip
+	if(nexthop =~ /\//) # ifes ip ### ????
 	    @cisco.interface "#{del} ipv6 address #{nexthop}"
 	else
 	    @cisco.global "#{del} ipv6 route #{ip} #{nexthop}"
 	end
 
 	if @if_params["rpf"]
+	    @cisco.acl ["#{del} permit ipv6 FE80::/10 #{ip}", "#{del} permit ipv6 #{ip} any"]
 	    raise "no rpf support yet"
 	end
     end
@@ -562,13 +571,69 @@ class CiscoInterface
     end
 end
 
+class BladeInterface
+    attr_accessor :interface_range_last, :interface, :interface_type, :interface_id, :prefix, :if_params
+
+    def initialize(switch)
+	@switch = switch
+    end
+
+    def self.parse(intf)
+	_, prefix, mod, start, _, last = /^([a-zA-Z-]+)(\d+\/)?(\d+)(-(\d+))?/.match(intf).to_a
+	prefix = IntLib.prefix_match(prefix, CiscoInterface.interface_types.keys)
+	interface_type = CiscoInterface.interface_types[prefix]
+	[prefix, mod, start, last, interface_type]
+    end
+
+    def expand_interface(interface)
+	@interface = interface
+	@cisco = Cisco.new("interface port", @interface)
+    end
+
+    def destroy
+	@cisco.interface "shutdown"
+	@cisco.global "default interface #{@interface}"
+    end
+
+    def access(vlan)
+	@cisco.interface "pvid #{vlan}"
+    end
+
+    def trunk(vlan_list)
+	@cisco.interface "tagging"
+    end
+
+    def channel_member(channel)
+	@cisco.interface ["channel-group #{channel} mode active"] # TODO mode
+    end
+
+    def set_param(param, value)
+	case param
+	when "description"
+	    @cisco.interface "name #{value}"
+	when "mtu"
+	    @cisco.interface "mtu #{value}"
+	else
+	    raise "unknown parameter"
+	end
+    end
+
+    def add_extra(extra)
+	@cisco.interface extra
+    end
+
+    def commit
+	@cisco.commit if defined?@cisco
+    end
+end
+
 
 class Ip
     attr_accessor :interface, :ip
-    def initialize(ip, switch, interface, nexthop = nil)
+    def initialize(ip, switch, interface, nexthop, secondary=nil)
 	nexthop ||= "0.0.0.0/0" # TODO ipv6
-	@interface, @ip, @nexthop, @switch = interface, ip, nexthop, switch
-	@sql = Sql.get("SELECT * FROM ip WHERE (ip, l3_switch, l3_interface, nexthop)=($1::inet, $2, $3, $4::inet)", [ip, switch, interface, nexthop])
+	@interface, @ip, @nexthop, @switch, @secondary = interface, ip, nexthop, switch, secondary
+	@sql = Sql.get("SELECT * FROM ip WHERE (ip, l3_switch, l3_interface, nexthop)=($1, $2, $3, $4)", [ip, switch, interface, nexthop])
     end
 
     def unused?
@@ -579,12 +644,21 @@ class Ip
 	raise "#{@switch}/#{@interface}:#{@ip}/#{@nexthop}: exact route doesn't exist!" unless @sql
     end
 
+    def secondary?
+	@sql['secondary']
+    end
+
+    def self.primaryv4?(switch, interface)
+	r = Sql.get("SELECT COUNT(*) AS primary FROM ip WHERE network(ip)=network(nexthop) and family(ip)=4 AND (l3_switch, l3_interface)=($1, $2)", [switch, interface])
+	r['primary'].to_i > 0
+    end
+
     def self.list(switch, interface)
-	Sql.conn.exec_params("SELECT family(ip),text(ip) ip,nexthop FROM ip WHERE (l3_switch, l3_interface)=($1, $2)", [switch, interface])
+	Sql.conn.exec_params("SELECT family(ip),text(ip) ip,nexthop FROM ip WHERE (l3_switch, l3_interface)=($1, $2) ORDER BY secondary", [switch, interface])
     end
 
     def add
-	Sql.exec("INSERT INTO ip (ip, l3_switch, l3_interface, nexthop) VALUES($1, $2, $3, $4)", [@ip, @switch, @interface, @nexthop])
+	Sql.exec("INSERT INTO ip (ip, l3_switch, l3_interface, nexthop, secondary) VALUES($1, $2, $3, $4, $5)", [@ip, @switch, @interface, @nexthop, @secondary])
     end
 
     def remove
