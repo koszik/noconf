@@ -368,7 +368,8 @@ end
 class Cisco
     def initialize(type, interface)
 	@type, @interface = type, interface
-	@interface_cmds = @global_cmds = @global_end_cmds = @acl_cmds = ""
+	@interface_cmds = "interface  #{@interface}\n"
+	@global_cmds = @global_end_cmds = @acl_cmds = ""
     end
 
     def interface(cmd)
@@ -386,13 +387,22 @@ class Cisco
 	@global_end_cmds += cmd + "\n"
     end
 
-    def acl(cmd)
-	cmd = cmd.join(" \n") if cmd.kind_of?(Array)
-	@acl_cmds += " "+ cmd + "\n"
+    def aclname(v, acl)
+	if v == :ipv4
+	    @acl_cmds = "ip access-list extended #{acl}\n"
+	else
+	    @acl_cmds = "ipv6 acces-list #{acl}\n"
+	end
     end
 
+    def acl(cmd)
+	cmd = cmd.join("\n ") if cmd.kind_of?(Array)
+	@acl_cmds += " " + cmd + "\n"
+    end
+
+
     def commit
-	Cisco.cmd @global_cmds+"interface #{@interface}\n#{@interface_cmds}"+@global_end_cmds
+	Cisco.cmd @global_cmds + @acl_cmds + @interface_cmds + @global_end_cmds
 	initialize(@type, @interface)
     end
 
@@ -466,7 +476,7 @@ class CiscoInterface
 	else
 	    # TODO getunnumberedip
 	    ip = getunnumberedip
-	    cisco.interface ["ip address #{ip} 255.255.255.0"]
+	    @cisco.interface ["ip address #{ip} 255.255.255.0"]
 	end
 	@cisco.interface ["ip flow ingress"] if @switch.features["netflow"]
 	@cisco.interface ["no ip redirects", "no shutdown", "load-interval 30"]
@@ -522,15 +532,20 @@ class CiscoInterface
     end
 
     def mod_ip4(del, ip, nexthop, secondary)
-	if(nexthop)
+	if(nexthop and nexthop.prefix != 32)
 	    sec = secondary ? "secondary" : ""
 	    @cisco.interface "#{del} ip address #{nexthop} #{nexthop.mask} #{sec} !nowarning" # using a /31 generates a warning
 	else
-	    @cisco.global "#{del} ip route #{ip.base} #{ip.mask} #{@interface} #{nexthop}"
+	    @cisco.global_end "#{del} ip route #{ip.base} #{ip.mask} #{@interface} #{nexthop}"
 	end
-	if @if_params["rpf"]
+	if @if_params["rpf"] ## TODO support urpf?
+	    if true # !acl
+		acl = "P#{@interface}-IN"
+		@cisco.interface "ip access-group #{acl} in"
+	    end
+	    @cisco.aclname(:ipv4, acl)
+	    @cisco.acl ["no deny ip any any log-input", "no deny ip any any"]
 	    @cisco.acl "#{del} permit ip #{ip.base} #{ip.invmask} any"
-	    raise "no rpf support yet"
 	end
     end
 
