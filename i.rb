@@ -54,13 +54,23 @@ class Switch
     end
 
     def self.create(smallname, hostname, ip, model)
-	#Sql.exec("INSERT INTO switches (id, description, ip, model) VALUES($1, $2, $3, $4)", [smallname, hostname, ip, model]);
+	Sql.init
+	Sql.exec("INSERT INTO switches (id, description, ip, model) VALUES($1, $2, $3, $4)", [smallname, hostname, ip, model]);
 	#return if($sw->{virtual});
-	return if Conf.noexec
-	FileUtils.mkdir "/home/rrd/data/#{hostname}"
-	FileUtils.chown "rrd", nil, "/home/rrd/data/#{hostname}"
-	FileUtils.symlink "/home/rrd/data/#{hostname}", "/home/rrd/data/#{smallname}"
-	File.open("/home/rrd/scripts/get/update-autoadded", "a") { |f| f.puts "./switch #{hostname} #{ip} &" }
+	if !Conf.noexec
+	    FileUtils.mkdir "/home/rrd/data/#{hostname}"
+	    FileUtils.chown "rrd", nil, "/home/rrd/data/#{hostname}"
+	    FileUtils.symlink "/home/rrd/data/#{hostname}", "/home/rrd/data/#{smallname}"
+	    File.open("/home/rrd/scripts/get/update-autoadded", "a") { |f| f.puts "./switch #{hostname} #{ip} &" }
+	end
+	return Switch(smallname)
+    end
+
+    def template
+	template = File.read("templates/#{@sql['model']}")
+	template.gsub!(/@HOSTNAME@/, @sql['description'])
+	template.gsub!(/@MAINIP@/, @sql['ip'])
+	puts template
     end
 end
 
@@ -74,7 +84,8 @@ end
 
 
 def Switch(switch)
-    sql = Sql.conn.exec_params("SELECT * FROM switches WHERE id=$1", [switch])[0]
+    Sql.init
+    sql = Sql.get("SELECT * FROM switches WHERE id=$1", [switch])
     # if sql.model ...
     CiscoSwitch.new(switch, sql)
 end
@@ -642,6 +653,20 @@ class BladeInterface
     end
 end
 
+class Vlan
+    def initialize(vlan)
+	@sql = Sql.get("SELECT * FROM vlan WHERE vlan=$1", [vlan])
+    end
+
+    def add
+        Sql.exec("INSERT INTO vlan (vlan) VALUES($1)", [vlan])
+    end
+
+    def remove
+	Sql.exec("DELETE FROM vlan WHERE vlan=$1", [vlan])
+    end
+end
+
 
 class Ip
     attr_accessor :interface, :ip
@@ -705,7 +730,7 @@ end
 
 
 class Sql
-    def self.conn
+    def self.init
 	return @@conn if defined? @@conn
 	@@conn = PG.connect(Conf.get["db"])
 	@@conn.exec "BEGIN"
