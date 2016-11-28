@@ -23,6 +23,12 @@ module IPAddress
 	    [u32].pack("N").unpack("CCCC").join(".")
 	end
     end
+
+    class IPv6
+	def base
+	    "notsupported"
+	end
+    end
 end
 
 
@@ -317,7 +323,7 @@ class Interface
 	nexthopa = nil
 	if nexthop
 	    nexthopa = IPAddress.parse(nexthop)
-	    raise "nexthop error" if ipa.base != nexthopa.base or ipa.mask != nexthopa.mask
+	    raise "nexthop error" if ipa.base != nexthopa.base or ipa.prefix != nexthopa.prefix
 	end
 	ip = Ip.new(ip, @switch.to_s, @interface, nexthop, secondary)
 	ip.unused?
@@ -496,7 +502,7 @@ class CiscoInterface
 
     def access(vlan)
 	layer2_init
-	cisco.interface [
+	@cisco.interface [
 	    "switchport",
 	    "switchport mode access",
 	    "switchport access vlan #{vlan}",
@@ -535,7 +541,7 @@ class CiscoInterface
     end
 
     def mod_ip(del, ip, nexthop, secondary)
-	if ip =~ /:/
+	if ip.to_s =~ /:/
 	    mod_ip6(del, ip, nexthop)
 	else
 	    mod_ip4(del, ip, nexthop, secondary)
@@ -543,11 +549,11 @@ class CiscoInterface
     end
 
     def mod_ip4(del, ip, nexthop, secondary)
-	if(nexthop and nexthop.prefix != 32)
+	if(!nexthop or nexthop.prefix == 32)
+	    @cisco.global_end "#{del} ip route #{ip.base} #{ip.mask} #{@interface} #{nexthop}"
+	else
 	    sec = secondary ? "secondary" : ""
 	    @cisco.interface "#{del} ip address #{nexthop} #{nexthop.mask} #{sec} !nowarning" # using a /31 generates a warning
-	else
-	    @cisco.global_end "#{del} ip route #{ip.base} #{ip.mask} #{@interface} #{nexthop}"
 	end
 	if @if_params["rpf"] ## TODO support urpf?
 	    if true # !acl
@@ -561,10 +567,10 @@ class CiscoInterface
     end
 
     def mod_ip6(del, ip, nexthop)
-	if(nexthop =~ /\//) # ifes ip ### ????
-	    @cisco.interface "#{del} ipv6 address #{nexthop}"
+	if(!nexthop or nexthop.prefix == 128)
+	    @cisco.global "#{del} ipv6 route #{ip}/#{ip.prefix} #{nexthop}"
 	else
-	    @cisco.global "#{del} ipv6 route #{ip} #{nexthop}"
+	    @cisco.interface "#{del} ipv6 address #{nexthop}/#{nexthop.prefix}"
 	end
 
 	if @if_params["rpf"]
