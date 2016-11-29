@@ -1,0 +1,14 @@
+#!/usr/bin/ruby -w
+
+
+## Add a new device
+# addswitch smallname hostname loopback_ip model
+# addswitch c01 core1 1.2.3.4
+
+require './i.rb'
+
+model, smallname, hostname, ip = ARGV
+
+sw=Switch.create(smallname, hostname, ip, model)
+sw.template
+#Sql.commit

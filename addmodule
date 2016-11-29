@@ -1,0 +1,16 @@
+#!/usr/bin/ruby -w
+
+# Add a set of interfaces to a device
+# addmodule dev ints
+# addmodule c01 g5/1-16
+# addmodule a03 g1/0/1-52
+# addmodule d07 e1-24
+
+require './i.rb'
+
+switch, add = ARGV
+
+sw = Switch(switch)
+sw.add_module(add)
+Sql.commit
+

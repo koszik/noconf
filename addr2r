@@ -1,0 +1,40 @@
+#!/usr/bin/ruby -w
+
+
+require "./i.rb"
+
+
+## Add a new router-router link, with ospf
+
+vlan=2210
+vlans="#{vlan}"
+r=["c02", "a10"]
+int=["te2/2", "te0/1"]
+ip=["100.64.5.153/31","100.64.5.152/31"]
+
+
+ipa = IPAddress.parse(ip[0])
+net = ipa.base+"/"+ipa.prefix.to_s
+
+[0,1].each {|i|
+    sw=Switch(r[i])
+    intf=sw.interface(int[i])
+    intf.trunk(vlans)
+    intf.set_param("description", r[1-i])
+    intf.set_param("mtu", 9216)
+    vlif = sw.create_interface("vl#{vlan}")
+    vlif.layer3
+    vlif.set_param("description", r[1-i])
+    vlif.set_param("rpf", "false")
+    ##vlif.set_param("mtu", 1500)
+    vlif.add_ip(net, ip[i])
+    vlif.add_ip("2a01:270:c:#{r[0]}:#{r[1]}::/126", "2a01:270:c:#{r[0]}:#{r[1]}::#{i+1}/126")
+    vlif.add_extra("ipv6 ospf 1 area 0")
+    intf.commit
+    vlif.commit
+}
+
+
+Sql.commit
+puts "don't forget to remove the static default"
+

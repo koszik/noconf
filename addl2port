@@ -1,0 +1,16 @@
+#!/usr/bin/ruby -w
+
+## Create layer 2 access port
+# addl2port dev vlan int descr
+# addl2port c01 123 Fa9/31 "hosting - xy"
+
+require './i.rb'
+
+switch, vlan, interface, desc = ARGV
+
+int = Switch(switch).interface(interface)
+int.access(vlan)
+int.set_param("description", desc)
+int.commit
+Sql.commit
+

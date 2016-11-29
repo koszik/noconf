@@ -100,7 +100,7 @@ end
 class Stat
     def self.create(switch, interface)
 	interface = interface.gsub(/\//, '.')
-	cmd = "echo n | cp -pi /var/atw/rrd/xdl.rrd /var/atw/rrd/#{switch}/#{interface}"
+	cmd = "echo n | cp -pi /home/rrd/data/xdl.rrd /home/rrd/data/#{switch}/#{interface}"
 	puts cmd if Conf.printexec
 	`#{cmd}` unless Conf.noexec
     end
@@ -108,7 +108,7 @@ class Stat
     def self.destroy(switch, interface)
 	interface = interface.gsub(/\//, '.')
 	t = Time.now.to_i
-	cmd = "mv /var/atw/rrd/#{switch}/#{interface} /var/atw/rrd/archive/#{t}-#{switch}-#{interface}; mv /var/atw/rrd/mvtmp/#{switch}_#{interface} /var/atw/rrd/archive/#{t}-#{switch}-mvtmp-#{interface}"
+	cmd = "mv /home/rrd/data/#{switch}/#{interface} /home/rrd/data/archive/#{t}-#{switch}-#{interface}; mv /home/rrd/data//mvtmp/#{switch}_#{interface} /home/rrd/data/archive/#{t}-#{switch}-mvtmp-#{interface}"
 	puts cmd if Conf.printexec
 	`#{cmd}` unless Conf.noexec
     end
@@ -120,7 +120,8 @@ class Util
 	list.gsub(/(\d+)-(\d+)/) {($1..$2).to_a.join(",")}
     end
 
-    def flat(v)
+    # convert a list to a list of ranges.
+    def compact(v)
 	last, start, ret = nil, nil, nil
 	v.split(",").each{ |l| l=l.to_i
 	    if last != nil
@@ -157,19 +158,23 @@ end
 class Interface
     attr_accessor :switch, :interface
 
+    def load
+	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+	@if.if_params = @if_params
+    end
+
     def initialize(switch, interface, _if, create = false)
 	@if = _if
 	@switch = switch
 	@if.expand_interface(interface)
 	@interface = @if.interface
-	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
+	load
 	if create and @if_params
 	    raise "#{@switch}/#{@interface}: interface already exists"
 	end
 	if !create and !@if_params
 	    raise "#{@switch}/#{@interface}: interface doesn't exist"
 	end
-	@if.if_params = @if_params
     end
     def to_s
 	@switch.to_s+"/"+@if.interface
@@ -181,14 +186,12 @@ class Interface
 
     def set(cmd)
 	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
-	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
-	@if.if_params = @if_params
+	load
     end
 
     def set1(cmd, param)
 	Sql.exec("UPDATE if_params SET #{cmd} WHERE (switch,interface)=($2,$3)", [param, @switch.to_s, @if.interface])
-	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
-	@if.if_params = @if_params
+	load
     end
 
 
@@ -228,8 +231,7 @@ class Interface
     def create # addmodule, vlan, po
 	# unused is checked during init
 	Sql.exec "INSERT INTO if_params (switch, interface, l2, l3, bandwidth) VALUES($1, $2, false, false, $3)", [@switch.to_s, @if.interface, @if.interface_type[:bw]]
-	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
-	@if.if_params = @if_params
+	load
     end
 
     def destroy
@@ -248,8 +250,7 @@ class Interface
 	else
 	    Sql.exec "UPDATE if_params SET l2=false,l3=false WHERE (switch, interface)=($1,$2)", [@switch.to_s, @if.interface]
 	end
-	@if_params = Sql.get("SELECT * FROM if_params WHERE (switch,interface)=($1,$2)", [@switch.to_s, @if.interface])
-	@if.if_params = @if_params
+	load
     end
 
     def clone(from)
@@ -273,7 +274,7 @@ class Interface
 	    }
 	elsif @if_params["l2"]
 	    if @if_params["vlan_list"]
-		@if.trunk(Util.flat(@if_params["vlan_list"][1..-2]))
+		@if.trunk(Util.compact(@if_params["vlan_list"][1..-2]))
 	    elsif @if_params["vlan"]
 		@if.access(@if_params["vlan"])
 	    end
@@ -489,7 +490,7 @@ class CiscoInterface
 	    @cisco.interface ["no cdp enable", "no switchport"]
 	end
 	if @switch.features["unnumbered"]
-	    @cisco.interface ["ip unnumbered Loopback101"] # todo config?
+	    @cisco.interface ["ip unnumbered Loopback101"] # todo config
 	else
 	    # TODO getunnumberedip
 	    ip = getunnumberedip
@@ -662,6 +663,10 @@ end
 class Vlan
     def initialize(vlan)
 	@sql = Sql.get("SELECT * FROM vlan WHERE vlan=$1", [vlan])
+    end
+
+    def self.create(vlan)
+	Sql.exec()
     end
 
     def add

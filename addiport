@@ -1,0 +1,17 @@
+#!/usr/bin/ruby -w
+
+## Add layer 3 port with ip routed to it
+# addiport dev int ip descr
+# addiport c01 Te1/1 1.2.3.4 "link name"
+
+require './i.rb'
+
+switch, interface, ip, desc = ARGV
+
+
+int=Switch(switch).interface(interface)
+int.layer3
+int.set_param("description", desc)
+int.add_ip(ip)
+int.commit
+#Sql.commit
