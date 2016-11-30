@@ -769,26 +769,3 @@ class Sql
 	@@conn.exec "COMMIT"
     end
 end
-
-
-# Switch("c03").interface("vlan2103").create
-# Switch("c03").addmodule("te1/1-4")
-# Switch("c03").interface("vlan2103").add_ip("10.0.0.0/30", "10.0.0.1/30")
-
-=begin
-#ip = int.ip("1.2.3.4")
-ip = Switch("c01").interface("fast1").ip("1.2.3.4").add
-puts ip
-pp ip.class.name
-pp ip.interface.switch
-
-Sql.conn.exec( "SELECT * FROM pg_stat_activity" ) do |result|
-  puts "     PID | User             | Query"
-  result.each do |row|
-    puts " %7d | %-16s | %s " %
-      row.values_at('procpid', 'usename', 'current_query')
-  end
-end
-
-Sql.conn.exec("SELECT * FROM if_params WHERE vlan_list is not null") { |r| r.each { |x| puts x } }
-=end
