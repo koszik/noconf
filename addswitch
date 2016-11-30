@@ -3,12 +3,12 @@
 
 ## Add a new device
 # addswitch smallname hostname loopback_ip model
-# addswitch c01 core1 1.2.3.4
+# addswitch c01 core1 1.2.3.4 c37560e-15.2
 
 require './i.rb'
 
-model, smallname, hostname, ip = ARGV
+smallname, hostname, ip, model = ARGV
 
 sw=Switch.create(smallname, hostname, ip, model)
 sw.template
-#Sql.commit
+Sql.commit
