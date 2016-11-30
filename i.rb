@@ -67,7 +67,7 @@ class Switch
 	    FileUtils.mkdir "/home/rrd/data/#{hostname}"
 	    FileUtils.chown "rrd", nil, "/home/rrd/data/#{hostname}"
 	    FileUtils.symlink "/home/rrd/data/#{hostname}", "/home/rrd/data/#{smallname}"
-	    File.open("/home/rrd/scripts/get/update-autoadded", "a") { |f| f.puts "./switch #{hostname} #{ip} &" }
+	    File.open("/home/rrd/scripts/get/update-autoadded", "a") { |f| f.puts "./switch #{smallname} #{ip} &" }
 	end
 	return Switch(smallname)
     end
